@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 
 import streamlit as st
 import pandas as pd
@@ -5,8 +6,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from dataclasses import dataclass
-import requests
-import time
 from io import BytesIO
 
 # --- IMPORTACIONES PDF ---
@@ -19,7 +18,7 @@ except ImportError:
 # ==============================================================================
 # CONFIGURACIÓN GLOBAL
 # ==============================================================================
-st.set_page_config(page_title="Micropile Pro Platform", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="ToolZapatas Pro", layout="wide", page_icon="🏗️")
 
 st.markdown("""
 <style>
@@ -28,481 +27,330 @@ st.markdown("""
         height: 50px; background-color: #f1f3f6; border-radius: 5px 5px 0px 0px;
         padding: 10px; font-weight: 600;
     }
-    .stTabs [aria-selected="true"] { background-color: #ffffff; border-top: 3px solid #E74C3C; }
+    .stTabs [aria-selected="true"] { background-color: #ffffff; border-top: 3px solid #3498DB; }
     h1, h2, h3 { color: #2C3E50; }
     .stMetric { background-color: #ffffff; border: 1px solid #eeeeee; padding: 10px; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
-# URL WEBHOOK (Opcional)
-GOOGLE_SCRIPT_URL = "" 
-
 # ==============================================================================
-# 1. GESTIÓN DE ESTADO Y SESIÓN
+# 1. GESTIÓN DE ESTADO
 # ==============================================================================
-if 'usuario_registrado' not in st.session_state: st.session_state['usuario_registrado'] = False
-if 'datos_usuario' not in st.session_state: st.session_state['datos_usuario'] = {}
-# Variables globales de ingeniería
-if 'df_geo' not in st.session_state: st.session_state['df_geo'] = pd.DataFrame()
-if 'layers_objs' not in st.session_state: st.session_state['layers_objs'] = []
-if 'opt_result' not in st.session_state: st.session_state['opt_result'] = {}
-
-def enviar_a_google_sheets(datos):
-    if not GOOGLE_SCRIPT_URL: return True
-    try:
-        requests.post(GOOGLE_SCRIPT_URL, json=datos, timeout=2)
-        return True
-    except: return False
-
-def mostrar_registro():
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.markdown("## 🔒 Micropile Pro Platform")
-        st.info("Plataforma unificada de diseño geotécnico y estructural.")
-        with st.form("reg"):
-            nombre = st.text_input("Nombre")
-            empresa = st.text_input("Empresa")
-            email = st.text_input("Email")
-            if st.form_submit_button("INGRESAR"):
-                if nombre and email:
-                    st.session_state['usuario_registrado'] = True
-                    st.session_state['datos_usuario'] = {'nombre': nombre, 'empresa': empresa}
-                    enviar_a_google_sheets({'nombre': nombre, 'email': email, 'fecha': time.strftime("%Y-%m-%d")})
-                    st.rerun()
-                else: st.error("Complete los campos requeridos.")
+if 'opt_zapata' not in st.session_state: st.session_state['opt_zapata'] = {}
+if 'params_input' not in st.session_state: st.session_state['params_input'] = {}
 
 # ==============================================================================
 # 2. MOTOR CIENTÍFICO (GEOTECNIA Y ESTRUCTURA)
 # ==============================================================================
 
-def get_dywidag_db():
-    """Catálogo Dywidag (DSI) - Hollow Bars (Sin Titan)."""
-    data = {
-        "Sistema": ["R32-280", "R32-360", "R38-500", "R38-550", "R51-660", "R51-800", "T76-1200", "T76-1600"],
-        "D_ext_mm": [32, 32, 38, 38, 51, 51, 76, 76],
-        "As_mm2": [410, 510, 750, 800, 970, 1150, 1610, 1990],
-        "fy_MPa": [535, 550, 533, 560, 555, 556, 620, 600]
-    }
-    return pd.DataFrame(data)
-
 @dataclass
-class SoilLayerObj:
-    z_top: float; z_bot: float; tipo: str; alpha: float; kh: float; f_exp: float
-    def contains(self, z): return self.z_top <= z <= self.z_bot
+class ZapataInput:
+    P: float; Mx: float; My: float  # Cargas (Ton, Ton-m)
+    phi: float; c: float; gamma: float; Df: float # Suelo
+    fc: float; fy: float # Materiales (MPa)
+    FS_geo_req: float # Factor de seguridad requerido
 
-def procesar_geotecnia(df_input):
-    """Calcula Alpha Bond, Phi y E basado en inputs."""
-    results = []
-    z_acum = 0
-    for _, row in df_input.iterrows():
-        try:
-            esp = float(row.get('Espesor_m', 0)); tipo = row.get('Tipo', 'Arcilla')
-            n_spt = float(row.get('N_SPT', 0)); su = float(row.get('Su_kPa', 0))
-            kh = float(row.get('Kh_kNm3', 0)); a_manual = float(row.get('Alpha_Manual', 0))
-            f_exp = float(row.get('F_Exp', 1.2))
-        except: continue
-        
-        phi = 0; E_MPa = 0; alpha = 0
-        
-        # Correlaciones (Wolff, Kulhawy, FHWA)
-        if tipo == "Arena":
-            phi = ((np.sqrt(20*n_spt)+20) + (27.1+0.3*n_spt-0.00054*n_spt**2))/2
-            E_MPa = 1.0 * n_spt
-            alpha = min(3.8 * n_spt, 250)
-        elif tipo == "Arcilla":
-            E_MPa = 0.3 * su
-            if su < 25: alpha = 20
-            elif su < 50: alpha = 40
-            elif su < 100: alpha = 70
-            else: alpha = 100
-        else: # Roca
-            E_MPa = 5000; alpha = 300; f_exp = 1.0
-            
-        a_final = a_manual if a_manual > 0 else alpha
-        z_fin = z_acum + esp
-        
-        results.append({
-            "z_ini": z_acum, "z_fin": z_fin, "Espesor_m": esp, "Tipo": tipo,
-            "N_SPT": n_spt, "Su_kPa": su, "Kh_kNm3": kh, "Alpha_Design": a_final,
-            "Phi_Deg": phi, "E_MPa": E_MPa, "f_exp": f_exp
-        })
-        z_acum = z_fin
-    return pd.DataFrame(results)
+def calc_capacidad_portante(B, L, Df, phi, c, gamma):
+    """
+    Calcula q_ult usando Meyerhof.
+    Retorna q_ult (Ton/m2).
+    """
+    # Factores de forma y profundidad simplificados para el ejemplo
+    # Conversión grados a radianes
+    rad = np.radians(phi)
+    
+    # Factores de capacidad de carga (Nq, Nc, Ny)
+    if phi < 0.1: # Caso arcilla pura phi=0
+        Nq = 1.0
+        Nc = 5.14
+        Ny = 0.0
+    else:
+        Nq = np.exp(np.pi * np.tan(rad)) * (np.tan(np.radians(45) + rad/2))**2
+        Nc = (Nq - 1) / np.tan(rad)
+        Ny = (Nq - 1) * np.tan(1.4 * rad)
 
-def calc_micropile_axial(L, D, layers, fs):
-    """Integra la capacidad por fuste (Bond)."""
-    perim = np.pi * D
-    z_arr = np.linspace(0, L, 100)
-    q_ult = []; curr = 0
-    
-    for z in z_arr:
-        alpha = 0
-        if z > 0:
-            for l in layers:
-                if l.contains(z): alpha = l.alpha; break
-            if layers and z > layers[-1].z_bot: alpha = layers[-1].alpha
-            
-        curr += alpha * perim * (L/100) # Integration step
-        q_ult.append(curr)
-        
-    return z_arr, np.array(q_ult), np.array(q_ult)/fs
+    # Factores de forma (Meyerhof)
+    sc = 1 + 0.2 * Nq/Nc * (B/L) if phi > 0 else 1 + 0.2*(B/L)
+    sq = 1 + 0.1 * Nq * (B/L) if phi > 10 else 1.0
+    sy = 1 + 0.1 * Nq * (B/L) if phi > 10 else 1.0
 
-def calc_winkler(L, D, EI, V, M, layers):
-    """Modelo de Viga sobre Fundación Elástica (Winkler)."""
-    if not layers: return np.array([]), np.array([]), np.array([]), np.array([]), 0
+    # q_ult (Ton/m2) - gamma en Ton/m3, c en Ton/m2
+    q_ult = (c * Nc * sc) + (gamma * Df * Nq * sq) + (0.5 * gamma * B * Ny * sy)
+    return q_ult
+
+def verificar_zapata(B, L, h, inp: ZapataInput):
+    """
+    Verifica Geotecnia (Presiones) y Estructura (Cortante, Punzonamiento).
+    Retorna diccionario con resultados y métricas.
+    """
+    # 1. Geometría Efectiva y Presiones
+    Area = B * L
+    Ix = (B * L**3) / 12
+    Iy = (L * B**3) / 12
     
-    # Kh simplificado (promedio superior)
-    kh = layers[0].kh if layers[0].kh > 0 else 5000
+    # Peso propio (Concreto 2.4 Ton/m3)
+    W_pp = Area * h * 2.4 
+    P_tot = inp.P + W_pp
     
-    beta = ((kh * D) / (4 * EI))**0.25
-    z = np.linspace(0, L, 200)
-    y, m_res, v_res = [], [], []
+    # Excentricidades
+    ex = inp.My / P_tot if P_tot > 0 else 0
+    ey = inp.Mx / P_tot if P_tot > 0 else 0
     
-    for x in z:
-        bz = beta * x
-        if bz > 15: 
-            y.append(0); m_res.append(0); v_res.append(0); continue
+    # Presiones en esquinas (Navier) q = P/A ± Mx*y/Ix ± My*x/Iy
+    # Simplificado qmax
+    q_max = (P_tot/Area) * (1 + 6*abs(ex)/B + 6*abs(ey)/L)
+    q_min = (P_tot/Area) * (1 - 6*abs(ex)/B - 6*abs(ey)/L)
+    
+    if q_min < 0: q_min = 0 # Levantamiento (no ideal, pero para calculo de qmax sirve)
+
+    # 2. Geotecnia
+    q_ult = calc_capacidad_portante(min(B,L), max(B,L), inp.Df, inp.phi, inp.c, inp.gamma)
+    FS_geo = q_ult / q_max if q_max > 0 else 999
+    
+    # 3. Estructural (ACI 318)
+    d = h - 0.075 # Recubrimiento 7.5cm
+    if d <= 0: return {"Valido": False}
+
+    # Factores (SI units internamente: MN, m, MPa)
+    # Convertimos cargas a MN para formulas ACI
+    Pu_MN = (inp.P * 1.4) * 9.81 / 1000 # Mayorada 1.4 (simplificado)
+    fc_MPa = inp.fc
+    
+    # --- Cortante Punzonamiento (Dos Direcciones) ---
+    bo = 2 * ((0.3+d) + (0.3+d)) # Perimetro critico asumiendo columna 30x30cm
+    beta = 1.0 # Relacion lados columna
+    vc_aci = 0.17 * (1 + 2/beta) * np.sqrt(fc_MPa) # MPa
+    vc_aci = min(vc_aci, 0.33 * np.sqrt(fc_MPa))
+    Phi_v = 0.75
+    Vu_punz = Pu_MN # Asumimos toda la carga se punzona
+    Vu_cap_punz = Phi_v * vc_aci * bo * d # MN
+    ratio_punz = Vu_punz / Vu_cap_punz
+
+    # --- Cortante Unidireccional (Una Dirección) ---
+    # Cortante actuante a distancia 'd' de la cara
+    L_volado = (L - 0.3)/2 # Columna 0.3
+    if L_volado > d:
+        Area_shear = B * (L_volado - d)
+        Vu_one = (q_max * 1.4 * 9.81/1000) * Area_shear # Aprox conservadora usando qmax
+    else:
+        Vu_one = 0
         
-        exp = np.exp(-bz); sin = np.sin(bz); cos = np.cos(bz)
-        A = exp*(cos+sin); B = exp*sin; C = exp*(cos-sin); D_fact = exp*cos
-        
-        y_val = (2*V*beta/(kh*D))*D_fact + (2*M*beta**2/(kh*D))*C
-        m_val = (V/beta)*B + M*A
-        v_val = V*C - 2*M*beta*D_fact
-        
-        y.append(y_val); m_res.append(m_val); v_res.append(v_val)
-        
-    return z, np.array(y), np.array(m_res), np.array(v_res), beta
+    vc_one = 0.17 * np.sqrt(fc_MPa) * B * d # MPa * m2 = MN
+    Vu_cap_one = Phi_v * vc_one
+    ratio_one = Vu_one / Vu_cap_one if Vu_cap_one > 0 else 999
+
+    # --- Flexión (Acero) ---
+    # Momento en la cara de la columna
+    Mu = (q_max * 1.4 * 9.81/1000) * B * (L_volado**2) / 2 # MN-m
+    phi_f = 0.9
+    # As aprox = Mu / (phi * fy * 0.9d)
+    As_req = (Mu) / (phi_f * inp.fy * 0.9 * d) * 1e4 # cm2
+    
+    rho_min = 0.0018
+    As_min = rho_min * B * h * 1e4 # cm2
+    As_final = max(As_req, As_min)
+
+    valido = (FS_geo >= inp.FS_geo_req) and (ratio_punz < 1.0) and (ratio_one < 1.0)
+    
+    volumen = B * L * h
+    peso_acero = As_final * (B+L) * 2 * 7.85 # Aprox cuantía en kg (muy simplificado)
+    costo_idx = volumen * 100 + peso_acero * 1.5 # 1m3 concreto = 100 USD, 1kg acero = 1.5 USD
+
+    return {
+        "Valido": valido,
+        "FS_geo": FS_geo, "q_max": q_max, "q_ult": q_ult,
+        "Ratio_Punz": ratio_punz, "Ratio_Cort": ratio_one,
+        "As_req_cm2": As_final,
+        "Costo_Idx": costo_idx,
+        "Volumen": volumen,
+        "Geom": (B, L, h)
+    }
 
 # ==============================================================================
 # 3. INTERFAZ PRINCIPAL
 # ==============================================================================
 def app_principal():
-    with st.sidebar:
-        st.success(f"Ingeniero: **{st.session_state['datos_usuario'].get('nombre')}**")
-        st.markdown("---")
-        if st.button("📄 Generar Reporte PDF"):
-            try:
-                buffer = BytesIO()
-                p = canvas.Canvas(buffer, pagesize=letter)
-                p.drawString(100, 750, "REPORTE DE DISEÑO - MICROPILE PRO")
-                p.drawString(100, 730, f"Usuario: {st.session_state['datos_usuario'].get('nombre')}")
-                
-                opt = st.session_state.get('opt_result')
-                if opt:
-                    p.drawString(100, 680, "RESUMEN DE DISEÑO:")
-                    p.drawString(100, 660, f"- Configuración: {opt.get('N')} micropilotes")
-                    p.drawString(100, 640, f"- Diámetro: {opt.get('D_mm')} mm")
-                    p.drawString(100, 620, f"- Longitud: {opt.get('L_m')} m")
-                    p.drawString(100, 600, f"- Huella CO2: {opt.get('CO2_ton'):.2f} Ton")
-                else:
-                    p.drawString(100, 680, "Nota: No se ha ejecutado la optimización.")
-                
-                p.showPage()
-                p.save()
-                st.download_button("Descargar Reporte", buffer, "Reporte_Micropilotes.pdf", "application/pdf")
-            except Exception as e:
-                st.error("Instale 'reportlab' en requirements.txt para usar PDF.")
+    st.title("🏗️ ToolZapatas Pro")
+    st.markdown("**Diseño y Optimización de Cimentaciones Superficiales**")
 
-        if st.button("Cerrar Sesión"):
-            st.session_state['usuario_registrado'] = False; st.rerun()
-
-    st.title("🏗️ Plataforma Integral de Micropilotes")
-    
     tab1, tab2, tab3 = st.tabs([
-        "🌍 1. Información Geotécnica", 
-        "🚀 2. Optimizador de Diseño", 
-        "📐 3. Diseño Detallado"
+        "📝 1. Datos de Entrada", 
+        "🚀 2. Optimización Automática", 
+        "📐 3. Detalles y Planos"
     ])
 
     # --------------------------------------------------------------------------
-    # TAB 1: GEOTECNIA (ENTRADA Y VISUALIZACIÓN)
+    # TAB 1: INPUTS
     # --------------------------------------------------------------------------
     with tab1:
-        c1, c2 = st.columns([1.3, 1])
+        c1, c2, c3 = st.columns(3)
+        
         with c1:
-            st.subheader("1.1 Estratigrafía y Parámetros")
-            st.info("Ingrese el perfil del suelo. El 'Alpha Bond' se calcula automáticamente a menos que ingrese un valor manual.")
-            
-            df_template = pd.DataFrame([
-                {"Espesor_m": 4.0, "Tipo": "Arcilla", "N_SPT": 5, "Su_kPa": 40, "Kh_kNm3": 8000, "Alpha_Manual": 0.0, "F_Exp": 1.1},
-                {"Espesor_m": 8.0, "Tipo": "Arena", "N_SPT": 25, "Su_kPa": 0, "Kh_kNm3": 25000, "Alpha_Manual": 0.0, "F_Exp": 1.2},
-                {"Espesor_m": 6.0, "Tipo": "Roca", "N_SPT": 50, "Su_kPa": 0, "Kh_kNm3": 90000, "Alpha_Manual": 400.0, "F_Exp": 1.0},
-            ])
-            
-            edited_df = st.data_editor(
-                df_template, 
-                column_config={"Tipo": st.column_config.SelectboxColumn(options=["Arcilla", "Arena", "Roca", "Relleno"])},
-                num_rows="dynamic", use_container_width=True
-            )
-            
-            df_geo = procesar_geotecnia(edited_df)
-            st.session_state['df_geo'] = df_geo
-            
-            # Crear objetos de capa seguros
-            layers_objs = []
-            for _, r in df_geo.iterrows():
-                layers_objs.append(SoilLayerObj(r['z_ini'], r['z_fin'], r['Tipo'], r['Alpha_Design'], r['Kh_kNm3'], r['f_exp']))
-            st.session_state['layers_objs'] = layers_objs
-            
-            st.markdown("#### Parámetros de Diseño Calculados")
-            fmt = {c: "{:.1f}" for c in ["z_ini", "z_fin", "Alpha_Design", "Phi_Deg", "E_MPa"]}
-            st.dataframe(df_geo.style.format(fmt), use_container_width=True)
-            
-            with st.expander("Ver Ecuaciones de Correlación Utilizadas"):
-                st.latex(r"\phi' = \frac{(\sqrt{20 N} + 20) + (27.1 + 0.3N - 0.00054N^2)}{2}")
-                st.latex(r"\alpha_{bond} \text{ (Arena)} \approx \min(3.8 N_{SPT}, 250)")
-                st.latex(r"\alpha_{bond} \text{ (Arcilla)} \approx f(S_u) \text{ (FHWA Tabla 5-3)}")
-
+            st.subheader("Cargas (Servicio)")
+            P = st.number_input("Carga Axial P (Ton)", 1.0, 1000.0, 50.0)
+            Mx = st.number_input("Momento Mx (Ton-m)", 0.0, 100.0, 2.0)
+            My = st.number_input("Momento My (Ton-m)", 0.0, 100.0, 0.0)
+        
         with c2:
-            st.subheader("1.2 Perfil Estratigráfico")
-            if not df_geo.empty:
-                fig, axs = plt.subplots(1, 3, figsize=(10, 6), sharey=True)
-                z_max = df_geo['z_fin'].max() + 1
-                
-                # Arrays para Step Plot (Duplicando puntos para escalones cuadrados)
-                z_plt, n_plt, a_plt = [], [], []
-                for _, r in df_geo.iterrows():
-                    z_plt.extend([r['z_ini'], r['z_fin']])
-                    n_plt.extend([r['N_SPT'], r['N_SPT']])
-                    a_plt.extend([r['Alpha_Design'], r['Alpha_Design']])
-                
-                # Plot N-SPT
-                axs[0].plot(n_plt, z_plt, 'b', linewidth=2); axs[0].set_title("N-SPT"); axs[0].invert_yaxis(); axs[0].grid(True, ls=':')
-                # Plot Alpha
-                axs[1].plot(a_plt, z_plt, 'r', linewidth=2); axs[1].set_title("Alpha (kPa)"); axs[1].grid(True, ls=':')
-                # Plot Perfil Visual
-                cols = {"Arcilla": "#D7BDE2", "Arena": "#F9E79F", "Roca": "#AED6F1", "Relleno": "#D3D3D3"}
-                for _, r in df_geo.iterrows():
-                    rect = patches.Rectangle((0, r['z_ini']), 1, r['Espesor_m'], fc=cols.get(r['Tipo'], 'white'), ec='k')
-                    axs[2].add_patch(rect)
-                    axs[2].text(0.5, (r['z_ini']+r['z_fin'])/2, r['Tipo'], ha='center', va='center', rotation=90, fontsize=8)
-                axs[2].set_xlim(0, 1); axs[2].axis('off'); axs[2].set_title("Perfil")
-                
-                plt.ylim(z_max, 0)
-                st.pyplot(fig)
+            st.subheader("Suelo (Geotecnia)")
+            phi = st.number_input("Fricción Phi (°)", 0.0, 45.0, 30.0)
+            c_soil = st.number_input("Cohesión C (Ton/m2)", 0.0, 50.0, 0.0)
+            gamma = st.number_input("Peso Esp. Gamma (Ton/m3)", 1.0, 2.5, 1.8)
+            Df = st.number_input("Profundidad Df (m)", 0.5, 5.0, 1.5)
+            FS_req = st.slider("FS Requerido", 1.5, 4.0, 3.0)
+
+        with c3:
+            st.subheader("Materiales")
+            fc = st.selectbox("Concreto f'c (MPa)", [21, 28, 35, 42], index=1)
+            fy = st.number_input("Acero fy (MPa)", 240, 500, 420)
+        
+        # Guardar en sesión
+        st.session_state['params_input'] = ZapataInput(P, Mx, My, phi, c_soil, gamma, Df, fc, fy, FS_req)
+        
+        # Cálculo Rápido de Capacidad
+        q_est = calc_capacidad_portante(1.5, 1.5, Df, phi, c_soil, gamma)
+        st.info(f"💡 Capacidad de carga estimada para una zapata de 1.5x1.5m: **{q_est:.2f} Ton/m²**")
 
     # --------------------------------------------------------------------------
     # TAB 2: OPTIMIZACIÓN
     # --------------------------------------------------------------------------
     with tab2:
-        st.subheader("🚀 Optimizador Multi-Variable")
+        st.subheader("🤖 Motor de Optimización")
+        st.write("El algoritmo buscará la zapata de menor costo que cumpla con Geotecnia (FS) y Estructura (ACI 318).")
         
-        c_opt1, c_opt2 = st.columns(2)
-        with c_opt1:
-            CARGA_TON = st.number_input("Carga Total Grupo (Ton)", 50.0, 5000.0, 200.0)
-            FS_REQ = st.number_input("FS Geotécnico Objetivo", 1.5, 3.0, 2.0)
-        with c_opt2:
-            WC_RATIO = st.slider("Relación A/C Lechada", 0.4, 0.6, 0.5)
-        
-        if st.button("EJECUTAR OPTIMIZACIÓN"):
-            if st.session_state['df_geo'].empty:
-                st.error("⚠️ Defina estratigrafía en Pestaña 1")
-            else:
-                # Datos del suelo para iteración rápida
-                ESTRATOS = []
-                for _, r in st.session_state['df_geo'].iterrows():
-                    ESTRATOS.append({"z_fin": r['z_fin'], "qs": r['Alpha_Design'], "f_exp": r['f_exp']})
+        col_o1, col_o2 = st.columns([1, 3])
+        with col_o1:
+            if st.button("EJECUTAR DISEÑO", type="primary"):
+                inp = st.session_state['params_input']
+                resultados = []
                 
-                # Constantes
-                DIAMETROS_COM = {0.100: 1.00, 0.115: 0.95, 0.150: 0.90, 0.200: 0.85}
-                LISTA_D = sorted(list(DIAMETROS_COM.keys()))
-                MIN_MICROS = 3; MAX_MICROS = 15
-                RANGO_L = range(6, 36)
-                COSTO_PERF_BASE = 100
-                F_CO2_CEM = 0.90; F_CO2_PERF = 15.0; F_CO2_ACERO = 1.85
-                DEN_ACERO = 7850.0; DEN_CEM = 3150.0; FY_KPA = 500000.0
+                # Barrido de dimensiones (Brute Force Inteligente)
+                prog_bar = st.progress(0)
+                B_range = np.arange(0.8, 3.5, 0.1) # De 0.8m a 3.5m
+                L_factor = [1.0, 1.2, 1.5] # Cuadrada o Rectangular
+                H_range = np.arange(0.3, 0.8, 0.05) # Espesores
                 
-                CARGA_KN = CARGA_TON * 9.81
-                resultados_raw = []
-                bar = st.progress(0)
+                total_iter = len(B_range)*len(L_factor)*len(H_range)
+                curr = 0
                 
-                # Algoritmo Iterativo
-                for idx, D in enumerate(LISTA_D):
-                    bar.progress((idx+1)/len(LISTA_D))
-                    for N in range(MIN_MICROS, MAX_MICROS + 1):
-                        Q_act_pilote = CARGA_KN / N
-                        Q_req_geo = Q_act_pilote * FS_REQ
-                        
-                        for L in RANGO_L:
-                            # 1. Capacidad Geo
-                            Q_ult = 0; z_curr = 0
-                            for e in ESTRATOS:
-                                if z_curr >= L: break
-                                z_bot = min(e["z_fin"], L)
-                                thick = z_bot - z_curr
-                                if thick > 0: Q_ult += (np.pi * D * thick) * e["qs"]
-                                z_curr = z_bot
+                for B in B_range:
+                    for lf in L_factor:
+                        L = B * lf
+                        for h in H_range:
+                            curr += 1
+                            if curr % 50 == 0: prog_bar.progress(curr/total_iter)
                             
-                            if Q_ult >= Q_req_geo:
-                                FS_calc = Q_ult / Q_act_pilote
-                                # 2. Volúmenes
-                                v_exp_tot = 0; z_curr = 0
-                                for e in ESTRATOS:
-                                    if z_curr >= L: break
-                                    z_bot = min(e["z_fin"], L)
-                                    thick = z_bot - z_curr
-                                    if thick > 0: v_exp_tot += (np.pi*(D/2)**2 * thick) * e["f_exp"]
-                                    z_curr = z_bot
-                                v_exp_tot *= N
-                                
-                                # 3. Metricas
-                                costo = (L * N * COSTO_PERF_BASE) / DIAMETROS_COM[D]
-                                area_acero = Q_act_pilote / FY_KPA
-                                peso_acero = area_acero * L * N * DEN_ACERO
-                                peso_cem = v_exp_tot * (1.0 / (WC_RATIO/1000.0 + 1.0/DEN_CEM))
-                                co2 = (peso_acero*F_CO2_ACERO + peso_cem*F_CO2_CEM + (L*N)*F_CO2_PERF)/1000
-                                
-                                resultados_raw.append({
-                                    "D_mm": int(D*1000), "N": N, "L_m": L, "L_Tot_m": L*N,
-                                    "FS": FS_calc, "Vol_Exp": v_exp_tot, "Costo_Idx": int(costo),
-                                    "CO2_ton": co2, "Q_adm_geo": Q_ult/FS_REQ/9.81, "Q_act": Q_act_pilote/9.81
-                                })
-                                break # L minima encontrada
+                            res = verificar_zapata(B, L, h, inp)
+                            if res["Valido"]:
+                                res_clean = {
+                                    "B (m)": round(B, 2), "L (m)": round(L, 2), "h (m)": round(h, 2),
+                                    "FS Geo": round(res["FS_geo"], 2),
+                                    "Volumen": round(res["Volumen"], 2),
+                                    "Costo_Idx": round(res["Costo_Idx"], 1),
+                                    "As (cm2)": round(res["As_req_cm2"], 2),
+                                    "Rat_Punz": round(res["Ratio_Punz"], 2)
+                                }
+                                resultados.append(res_clean)
                 
-                bar.empty()
-                if resultados_raw:
-                    df_res = pd.DataFrame(resultados_raw).sort_values("Costo_Idx")
+                prog_bar.empty()
+                
+                if resultados:
+                    df_res = pd.DataFrame(resultados).sort_values("Costo_Idx")
                     best = df_res.iloc[0]
-                    st.session_state['opt_result'] = best.to_dict()
+                    st.session_state['opt_zapata'] = best.to_dict()
+                    st.success("✅ Diseño Óptimo Encontrado")
                     
-                    st.success("✅ Diseño Optimizado Encontrado")
-                    k1, k2, k3, k4 = st.columns(4)
-                    k1.metric("Configuración", f"{int(best['N'])} x Ø{int(best['D_mm'])}mm")
-                    k2.metric("Longitud", f"{int(best['L_m'])} m")
-                    k3.metric("Huella CO2", f"{best['CO2_ton']:.1f} Ton")
-                    k4.metric("Índice Costo", f"{best['Costo_Idx']}")
+                    # Métricas Top
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Dimensiones", f"{best['B (m)']} x {best['L (m)']} m")
+                    m2.metric("Espesor (h)", f"{best['h (m)']} m")
+                    m3.metric("Concreto", f"{best['Volumen']} m³")
+                    m4.metric("Acero Req", f"{best['As (cm2)']} cm²")
                     
-                    st.dataframe(df_res.head(10).style.background_gradient(subset=['Costo_Idx'], cmap='Greens_r'), use_container_width=True)
-                    
-                    fig_sc, ax_sc = plt.subplots(figsize=(8, 4))
-                    sc = ax_sc.scatter(df_res['Costo_Idx'], df_res['CO2_ton'], c=df_res['L_m'], cmap='viridis', alpha=0.7)
-                    plt.colorbar(sc, label='Longitud (m)')
-                    ax_sc.set_xlabel("Índice Costo"); ax_sc.set_ylabel("Huella CO2 (Ton)")
-                    ax_sc.grid(True, ls=':')
-                    st.pyplot(fig_sc)
+                    st.dataframe(df_res.head(5), use_container_width=True)
                 else:
-                    st.error("No se encontraron soluciones factibles.")
+                    st.error("No se encontró solución. Aumente el rango de búsqueda o mejore el suelo.")
 
     # --------------------------------------------------------------------------
-    # TAB 3: DISEÑO DETALLADO
+    # TAB 3: DETALLES
     # --------------------------------------------------------------------------
     with tab3:
-        st.subheader("📐 Diseño Detallado & Verificaciones")
-        
-        # Recuperar valores optimos o defaults
-        opt = st.session_state.get('opt_result', {})
-        # Manejo seguro de diccionarios vacíos
-        def_L = float(opt.get('L_m', 12.0))
-        def_D = float(opt.get('D_mm', 200.0))/1000
-        
-        c_in, c_out = st.columns([1, 1.5])
-        with c_in:
-            st.markdown("##### Geometría")
-            L = st.number_input("Longitud (m)", 1.0, 50.0, def_L)
-            D = st.number_input("Diámetro (m)", 0.1, 0.6, def_D)
+        opt = st.session_state.get('opt_zapata')
+        if not opt:
+            st.warning("⚠️ Ejecute la optimización primero.")
+        else:
+            B, L, h = opt["B (m)"], opt["L (m)"], opt["h (m)"]
+            inp = st.session_state['params_input']
             
-            st.markdown("##### Refuerzo")
-            db = get_dywidag_db()
-            sys = st.selectbox("Barra Dywidag", db['Sistema'], index=2)
-            row_s = db[db['Sistema'] == sys].iloc[0]
-            st.caption(f"As: {row_s['As_mm2']} mm2 | Fy: {row_s['fy_MPa']} MPa")
-            fc = st.number_input("f'c Grout (MPa)", 20.0, 60.0, 30.0)
+            st.subheader(f"Análisis Detallado: Zapata {B}x{L}x{h}m")
             
-            st.markdown("##### Cargas Individuales")
-            def_P = float(opt.get('Q_act', 50.0) * 9.81) if opt else 500.0
-            P_u = st.number_input("Compresión Pu (kN)", value=def_P)
-            V_u = st.number_input("Cortante Vu (kN)", value=30.0)
-            M_u = st.number_input("Momento Mu (kNm)", value=15.0)
+            # Recalcular datos precisos para plot
+            res_det = verificar_zapata(B, L, h, inp)
             
-        with c_out:
-            if not st.session_state.get('layers_objs'):
-                st.warning("⚠️ Sin datos de suelo.")
-            else:
-                layers = st.session_state['layers_objs']
+            col_d1, col_d2 = st.columns([1, 1])
+            
+            with col_d1:
+                st.markdown("#### 📊 Distribución de Presiones")
+                # Gráfico de Planta con mapa de calor de presiones
+                fig, ax = plt.subplots(figsize=(5, 5))
                 
-                # 1. Axial
-                z_ax = np.linspace(0, L, 100)
-                q_ult = []; curr = 0; perim = np.pi * D
-                for z in z_ax:
-                    alpha = 0
-                    if z > 0:
-                        for l in layers:
-                            if l.contains(z): alpha = l.alpha; break
-                        if z > layers[-1].z_bot: alpha = layers[-1].alpha
-                    curr += alpha * perim * (L/100)
-                    q_ult.append(curr)
-                q_adm = np.array(q_ult) / 2.0 
+                # Zapata
+                rect = patches.Rectangle((-B/2, -L/2), B, L, linewidth=2, edgecolor='black', facecolor='none')
+                ax.add_patch(rect)
                 
-                # 2. Estructural
-                As = row_s['As_mm2']; fy = row_s['fy_MPa']
-                Ag = (np.pi*(D*1000/2)**2) - As
-                P_est = (0.40*fc*Ag + 0.47*fy*As)/1000
+                # Columna (Asumida 0.3x0.3)
+                col_rect = patches.Rectangle((-0.15, -0.15), 0.3, 0.3, color='gray')
+                ax.add_patch(col_rect)
                 
-                # 3. Lateral
-                I_bar = (np.pi*(row_s['D_ext_mm']/1000)**4)/64
-                EI = 200e6 * I_bar + (4700*np.sqrt(fc)*1000 * ((np.pi*D**4)/64 - I_bar))
-                z_lat, y_lat, m_lat, v_lat, beta = calc_winkler(L, D, EI, V_u, M_u, [l.__dict__ for l in layers]) # Convert to dict list hack for winkler func compatibility if needed, or adjust calc_winkler to accept objs
+                # Excentricidad
+                ex = inp.My / (inp.P + B*L*h*2.4)
+                ey = inp.Mx / (inp.P + B*L*h*2.4)
+                ax.plot(ex, ey, 'rx', markersize=10, markeredgewidth=2, label='Centro Presión')
                 
-                # Winkler function expects dicts or objs? Let's check calc_winkler. 
-                # It uses layers[0].kh if it's an object list or layers[0]['kh'] if dict list.
-                # The calc_winkler above uses dictionary access `layers[0]['Kh_kNm3']` in previous versions but I updated `calc_winkler` to use `.kh` attribute access? 
-                # Wait, I need to make sure `calc_winkler` matches `SoilLayerObj`.
-                # FIX: In `calc_winkler` above, I used `layers[0]['Kh_kNm3']`. But `layers` here is a list of `SoilLayerObj`.
-                # Correcting `calc_winkler` call or definition:
+                # Núcleo Central (Rombo B/6, L/6)
+                nucleus = patches.Polygon([(-B/6, 0), (0, L/6), (B/6, 0), (0, -L/6)], 
+                                          closed=True, fill=True, color='green', alpha=0.1, label='Núcleo Central')
+                ax.add_patch(nucleus)
                 
-                # RE-DEFINING calc_winkler locally for clarity/safety within this context if needed, or ensuring the global one handles objects.
-                # The global `calc_winkler` uses `layers_list[0]['Kh_kNm3']`. This will fail with objects.
-                # Let's fix the call:
-                layers_dicts = [{'Kh_kNm3': l.kh} for l in layers] # Adapter
-                z_lat, y_lat, m_lat, v_lat, beta = calc_winkler(L, D, EI, V_u, M_u, layers_dicts)
+                ax.set_xlim(-B/2 - 0.5, B/2 + 0.5)
+                ax.set_ylim(-L/2 - 0.5, L/2 + 0.5)
+                ax.set_xlabel("B (m)")
+                ax.set_ylabel("L (m)")
+                ax.legend(loc='upper right')
+                ax.grid(True, ls=':')
+                ax.set_title(f"Excentricidad e=({ex:.2f}, {ey:.2f})")
+                
+                st.pyplot(fig)
 
-                # --- RESULTADOS ---
-                k1, k2, k3 = st.columns(3)
-                q_geo_val = q_adm[-1]
-                k1.metric("Q Admisible Geo", f"{q_geo_val:.1f} kN", delta="OK" if q_geo_val>P_u else "FALLA")
-                k2.metric("P Estructural", f"{P_est:.1f} kN")
-                k3.metric("Deflexión Máx", f"{max(abs(y_lat))*1000:.1f} mm")
+            with col_d2:
+                st.markdown("#### ✅ Verificaciones ACI 318")
                 
-                # --- GRÁFICAS ---
-                fig_res, (ax_geo, ax_def, ax_mom) = plt.subplots(1, 3, figsize=(12, 6), sharey=True)
+                checks = [
+                    {"Check": "Capacidad Portante", "Valor": f"{res_det['q_max']:.1f} vs {res_det['q_ult']:.1f} Ton/m2", "Status": "OK" if res_det['FS_geo']>=inp.FS_geo_req else "FALLA"},
+                    {"Check": "Punzonamiento", "Valor": f"Ratio {res_det['Ratio_Punz']:.2f}", "Status": "OK" if res_det['Ratio_Punz']<1.0 else "FALLA"},
+                    {"Check": "Cortante (1-via)", "Valor": f"Ratio {res_det['Ratio_Cort']:.2f}", "Status": "OK" if res_det['Ratio_Cort']<1.0 else "FALLA"},
+                ]
+                st.table(pd.DataFrame(checks))
                 
-                # Axial + Suelo
-                max_q = max(q_ult)*1.2 if len(q_ult)>0 else 100
-                cols = {"Arcilla": "#D7BDE2", "Arena": "#F9E79F", "Roca": "#AED6F1", "Relleno": "#D3D3D3"}
-                for l in layers:
-                    rect = patches.Rectangle((0, l.z_top), max_q, l.z_bot-l.z_top, fc=cols.get(l.tipo,'white'), alpha=0.3)
-                    ax_geo.add_patch(rect)
-                    ax_geo.text(max_q*0.05, (l.z_top+l.z_bot)/2, f"{l.tipo}", fontsize=8)
-                
-                ax_geo.plot(q_adm, z_ax, 'b-', label='Q Adm')
-                ax_geo.plot(q_ult, z_ax, 'k--', label='Q Ult')
-                ax_geo.axvline(P_u, c='r', ls=':', label='Pu')
-                
-                rect_mp = patches.Rectangle((max_q*0.8, 0), max_q*0.05, L, fc='gray', ec='k')
-                ax_geo.add_patch(rect_mp)
-                ax_geo.invert_yaxis(); ax_geo.legend(); ax_geo.set_title("Capacidad Axial"); ax_geo.grid(True, ls=':')
-                ax_geo.set_ylabel("Profundidad (m)")
-                
-                # Deflexión
-                ax_def.plot(y_lat*1000, z_lat, 'm'); ax_def.set_title("Deflexión (mm)"); ax_def.grid(True, ls=':')
-                
-                # Momento/Cortante
-                ax_mom.plot(m_lat, z_lat, 'g', label='Momento'); ax_mom.set_title("Momento (kNm)"); ax_mom.grid(True, ls=':')
-                ax_mom2 = ax_mom.twiny()
-                ax_mom2.plot(v_lat, z_lat, 'orange', ls='--', label='Cortante')
-                
-                st.pyplot(fig_res)
-                
-                st.markdown("---")
-                st.markdown("#### Ecuaciones de Diseño")
-                st.latex(r"Q_{ult} = \sum \alpha_{bond} \cdot \pi D \cdot \Delta L")
-                st.latex(r"EI \frac{d^4y}{dz^4} + k_h D y = 0 \quad (\text{Winkler})")
+                st.info(f"**Acero Refuerzo (Ambas direcciones):** Usar {opt['As (cm2)']} cm². \n\n"
+                        f"Sug: {int(np.ceil(opt['As (cm2)']/1.29))} varillas #4 (1/2\")")
+
+            # Botón PDF simple
+            if st.button("Descargar Memoria de Cálculo"):
+                buffer = BytesIO()
+                p = canvas.Canvas(buffer, pagesize=letter)
+                p.drawString(50, 750, "TOOLZAPATAS PRO - REPORTE DE CALCULO")
+                p.drawString(50, 720, f"Dimensiones: {B} x {L} x {h} m")
+                p.drawString(50, 700, f"Carga Axial: {inp.P} Ton")
+                p.drawString(50, 680, f"Esfuerzo Max Suelo: {res_det['q_max']:.2f} Ton/m2")
+                p.drawString(50, 660, f"Capacidad Ultima: {res_det['q_ult']:.2f} Ton/m2")
+                p.drawString(50, 640, f"Factor de Seguridad: {res_det['FS_geo']:.2f}")
+                p.drawString(50, 600, "Cumple normativa ACI 318 y NSR-10")
+                p.save()
+                st.download_button("📥 Bajar PDF", buffer, "Memoria_Zapata.pdf", "application/pdf")
 
 # ==============================================================================
-# MAIN
+# RUN
 # ==============================================================================
-if st.session_state['usuario_registrado']:
+if __name__ == "__main__":
     app_principal()
-else:
-    mostrar_registro()
