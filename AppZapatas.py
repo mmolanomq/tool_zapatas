@@ -1,356 +1,366 @@
 # -*- coding: utf-8 -*-
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from dataclasses import dataclass
-from io import BytesIO
-
-# --- IMPORTACIONES PDF ---
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-except ImportError:
-    pass
 
 # ==============================================================================
-# CONFIGURACIÓN GLOBAL
+# CONFIGURACIÓN
 # ==============================================================================
-st.set_page_config(page_title="ToolZapatas Pro", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="ToolZapatas v2.0", layout="wide", page_icon="🏗️")
 
 st.markdown("""
 <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px; background-color: #f1f3f6; border-radius: 5px 5px 0px 0px;
-        padding: 10px; font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] { background-color: #ffffff; border-top: 3px solid #3498DB; }
-    h1, h2, h3 { color: #2C3E50; }
-    .stMetric { background-color: #ffffff; border: 1px solid #eeeeee; padding: 10px; border-radius: 5px; }
+    .stApp { background-color: #fcfcfc; }
+    h1, h2, h3 { color: #2C3E50; font-family: 'Segoe UI', sans-serif; }
+    .stMetric { background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px; }
+    .stDataFrame { border: 1px solid #d0d0d0; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 1. GESTIÓN DE ESTADO
-# ==============================================================================
-if 'opt_zapata' not in st.session_state: st.session_state['opt_zapata'] = {}
-if 'params_input' not in st.session_state: st.session_state['params_input'] = {}
-
-# ==============================================================================
-# 2. MOTOR CIENTÍFICO (GEOTECNIA Y ESTRUCTURA)
+# 1. FUNCIONES GEOTÉCNICAS (MOTOR DE CÁLCULO)
 # ==============================================================================
 
-@dataclass
-class ZapataInput:
-    P: float; Mx: float; My: float  # Cargas (Ton, Ton-m)
-    phi: float; c: float; gamma: float; Df: float # Suelo
-    fc: float; fy: float # Materiales (MPa)
-    FS_geo_req: float # Factor de seguridad requerido
-
-def calc_capacidad_portante(B, L, Df, phi, c, gamma):
+def obtener_suelo_en_punta(df_suelo, Df):
     """
-    Calcula q_ult usando Meyerhof.
-    Retorna q_ult (Ton/m2).
+    Determina las propiedades del suelo justo en la base de la zapata (Df).
     """
-    # Factores de forma y profundidad simplificados para el ejemplo
-    # Conversión grados a radianes
-    rad = np.radians(phi)
+    z_acum = 0
+    propiedades = None
     
-    # Factores de capacidad de carga (Nq, Nc, Ny)
-    if phi < 0.1: # Caso arcilla pura phi=0
+    # Si Df es 0 o menor (superficie), toma el primer estrato
+    if Df <= 0:
+        return df_suelo.iloc[0]
+
+    for idx, row in df_suelo.iterrows():
+        z_top = z_acum
+        z_bot = z_acum + row['Espesor (m)']
+        
+        # Verificar si la punta cae en este estrato
+        # Usamos < z_bot para atraparlo, pero si es igual al limite, 
+        # asumimos que apoya en el de arriba (o abajo según criterio, aquí conservador: el de arriba)
+        if z_top <= Df <= z_bot:
+            propiedades = row
+            break
+        
+        z_acum = z_bot
+    
+    # Si Df es más profundo que el último estrato, asumimos el último
+    if propiedades is None:
+        propiedades = df_suelo.iloc[-1]
+        
+    return propiedades
+
+def calcular_meyerhof(B, L, Df, gamma, c, phi, carga_axial_ton):
+    """
+    Calcula q_ult y Factores de Meyerhof con detalle.
+    Retorna diccionario completo.
+    """
+    # Conversiones y ajustes
+    phi_rad = np.radians(phi)
+    kp = np.tan(np.radians(45) + phi_rad/2)**2
+    
+    # 1. Factores de Capacidad de Carga (N)
+    if phi < 0.1: # Caso No Drenado (Arcilla Phi=0)
         Nq = 1.0
         Nc = 5.14
         Ny = 0.0
     else:
-        Nq = np.exp(np.pi * np.tan(rad)) * (np.tan(np.radians(45) + rad/2))**2
-        Nc = (Nq - 1) / np.tan(rad)
-        Ny = (Nq - 1) * np.tan(1.4 * rad)
+        Nq = np.exp(np.pi * np.tan(phi_rad)) * (np.tan(np.radians(45) + phi_rad/2))**2
+        Nc = (Nq - 1) / np.tan(phi_rad)
+        Ny = (Nq - 1) * np.tan(1.4 * phi_rad)
 
-    # Factores de forma (Meyerhof)
-    sc = 1 + 0.2 * Nq/Nc * (B/L) if phi > 0 else 1 + 0.2*(B/L)
-    sq = 1 + 0.1 * Nq * (B/L) if phi > 10 else 1.0
-    sy = 1 + 0.1 * Nq * (B/L) if phi > 10 else 1.0
-
-    # q_ult (Ton/m2) - gamma en Ton/m3, c en Ton/m2
-    q_ult = (c * Nc * sc) + (gamma * Df * Nq * sq) + (0.5 * gamma * B * Ny * sy)
-    return q_ult
-
-def verificar_zapata(B, L, h, inp: ZapataInput):
-    """
-    Verifica Geotecnia (Presiones) y Estructura (Cortante, Punzonamiento).
-    Retorna diccionario con resultados y métricas.
-    """
-    # 1. Geometría Efectiva y Presiones
-    Area = B * L
-    Ix = (B * L**3) / 12
-    Iy = (L * B**3) / 12
-    
-    # Peso propio (Concreto 2.4 Ton/m3)
-    W_pp = Area * h * 2.4 
-    P_tot = inp.P + W_pp
-    
-    # Excentricidades
-    ex = inp.My / P_tot if P_tot > 0 else 0
-    ey = inp.Mx / P_tot if P_tot > 0 else 0
-    
-    # Presiones en esquinas (Navier) q = P/A ± Mx*y/Ix ± My*x/Iy
-    # Simplificado qmax
-    q_max = (P_tot/Area) * (1 + 6*abs(ex)/B + 6*abs(ey)/L)
-    q_min = (P_tot/Area) * (1 - 6*abs(ex)/B - 6*abs(ey)/L)
-    
-    if q_min < 0: q_min = 0 # Levantamiento (no ideal, pero para calculo de qmax sirve)
-
-    # 2. Geotecnia
-    q_ult = calc_capacidad_portante(min(B,L), max(B,L), inp.Df, inp.phi, inp.c, inp.gamma)
-    FS_geo = q_ult / q_max if q_max > 0 else 999
-    
-    # 3. Estructural (ACI 318)
-    d = h - 0.075 # Recubrimiento 7.5cm
-    if d <= 0: return {"Valido": False}
-
-    # Factores (SI units internamente: MN, m, MPa)
-    # Convertimos cargas a MN para formulas ACI
-    Pu_MN = (inp.P * 1.4) * 9.81 / 1000 # Mayorada 1.4 (simplificado)
-    fc_MPa = inp.fc
-    
-    # --- Cortante Punzonamiento (Dos Direcciones) ---
-    bo = 2 * ((0.3+d) + (0.3+d)) # Perimetro critico asumiendo columna 30x30cm
-    beta = 1.0 # Relacion lados columna
-    vc_aci = 0.17 * (1 + 2/beta) * np.sqrt(fc_MPa) # MPa
-    vc_aci = min(vc_aci, 0.33 * np.sqrt(fc_MPa))
-    Phi_v = 0.75
-    Vu_punz = Pu_MN # Asumimos toda la carga se punzona
-    Vu_cap_punz = Phi_v * vc_aci * bo * d # MN
-    ratio_punz = Vu_punz / Vu_cap_punz
-
-    # --- Cortante Unidireccional (Una Dirección) ---
-    # Cortante actuante a distancia 'd' de la cara
-    L_volado = (L - 0.3)/2 # Columna 0.3
-    if L_volado > d:
-        Area_shear = B * (L_volado - d)
-        Vu_one = (q_max * 1.4 * 9.81/1000) * Area_shear # Aprox conservadora usando qmax
+    # 2. Factores de Forma (Shape - s)
+    # Meyerhof standard:
+    if phi == 0:
+        sq = 1.0
+        sc = 1 + 0.2 * (B/L)
+        sy = 1.0
     else:
-        Vu_one = 0
-        
-    vc_one = 0.17 * np.sqrt(fc_MPa) * B * d # MPa * m2 = MN
-    Vu_cap_one = Phi_v * vc_one
-    ratio_one = Vu_one / Vu_cap_one if Vu_cap_one > 0 else 999
+        sc = 1 + 0.2 * kp * (B/L)
+        sq = 1 + 0.1 * kp * (B/L)
+        sy = 1 + 0.1 * kp * (B/L)
 
-    # --- Flexión (Acero) ---
-    # Momento en la cara de la columna
-    Mu = (q_max * 1.4 * 9.81/1000) * B * (L_volado**2) / 2 # MN-m
-    phi_f = 0.9
-    # As aprox = Mu / (phi * fy * 0.9d)
-    As_req = (Mu) / (phi_f * inp.fy * 0.9 * d) * 1e4 # cm2
+    # 3. Factores de Profundidad (Depth - d)
+    # Para Df/B <= 1 (Simplificado)
+    if Df/B <= 1:
+        k_d = Df/B
+    else:
+        k_d = np.arctan(Df/B) # En radianes para Df/B > 1 (simplificación común)
+
+    if phi == 0:
+        dc = 1 + 0.4 * k_d
+        dq = 1.0
+        dy = 1.0
+    else:
+        dq = 1 + 0.1 * np.sqrt(kp) * k_d
+        sc_param = 1 if phi == 0 else sc # Ajuste formula general
+        dc = 1 + 0.4 * np.sqrt(kp) * k_d
+        dy = 1 + 0.1 * np.sqrt(kp) * k_d
+
+    # 4. Cálculo de q_ult
+    # Termino Cohesión: c * Nc * sc * dc
+    term_c = c * Nc * sc * dc
+    # Termino Sobrecarga: q * Nq * sq * dq (q = gamma * Df efectivo)
+    q_sobrecarga = gamma * Df
+    term_q = q_sobrecarga * Nq * sq * dq
+    # Termino Peso: 0.5 * gamma * B * Ny * sy * dy
+    term_y = 0.5 * gamma * B * Ny * sy * dy
     
-    rho_min = 0.0018
-    As_min = rho_min * B * h * 1e4 # cm2
-    As_final = max(As_req, As_min)
-
-    valido = (FS_geo >= inp.FS_geo_req) and (ratio_punz < 1.0) and (ratio_one < 1.0)
+    q_ult = term_c + term_q + term_y
     
-    volumen = B * L * h
-    peso_acero = As_final * (B+L) * 2 * 7.85 # Aprox cuantía en kg (muy simplificado)
-    costo_idx = volumen * 100 + peso_acero * 1.5 # 1m3 concreto = 100 USD, 1kg acero = 1.5 USD
-
     return {
-        "Valido": valido,
-        "FS_geo": FS_geo, "q_max": q_max, "q_ult": q_ult,
-        "Ratio_Punz": ratio_punz, "Ratio_Cort": ratio_one,
-        "As_req_cm2": As_final,
-        "Costo_Idx": costo_idx,
-        "Volumen": volumen,
-        "Geom": (B, L, h)
+        "q_ult": q_ult,
+        "Nq": Nq, "Nc": Nc, "Ny": Ny,
+        "sc": sc, "sq": sq, "sy": sy,
+        "dc": dc, "dq": dq, "dy": dy,
+        "term_c": term_c, "term_q": term_q, "term_y": term_y
     }
+
+# ==============================================================================
+# 2. VISUALIZACIÓN
+# ==============================================================================
+
+def plot_perfil_estratigrafico(df_suelo, Df, B, L_zapata, h_zapata):
+    """Genera gráfico Matplotlib con estratos y zapata."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    z_acum = 0
+    max_width = B * 3 if B > 0 else 5
+    center_x = max_width / 2
+    
+    # Colores por tipo
+    colors = {"Relleno": "#E5E7E9", "Arcilla": "#D7BDE2", "Arena": "#F9E79F", "Grava": "#A3E4D7", "Roca": "#AED6F1"}
+    
+    # 1. DIBUJAR ESTRATOS
+    max_depth = df_suelo['Espesor (m)'].sum()
+    if max_depth < Df + h_zapata + 2: max_depth = Df + h_zapata + 2
+    
+    for _, row in df_suelo.iterrows():
+        esp = row['Espesor (m)']
+        tipo = row['Tipo']
+        c_fill = colors.get(tipo, "#F2F3F4")
+        
+        # Rectangulo del estrato
+        rect = patches.Rectangle((0, z_acum), max_width, esp, facecolor=c_fill, edgecolor='#566573', alpha=0.6)
+        ax.add_patch(rect)
+        
+        # Texto del estrato
+        ax.text(0.2, z_acum + esp/2, f"{tipo}\n$\gamma$={row['Gamma (Ton/m3)']}\n$c$={row['Cohesion (Ton/m2)']}", 
+                va='center', fontsize=9, color='#17202A')
+        
+        z_acum += esp
+        
+    # 2. DIBUJAR ZAPATA
+    # Coordenadas esquina superior izquierda de la zapata
+    # La base está en Df. La parte superior está en Df - h
+    z_base = Df
+    z_top = Df - h_zapata
+    
+    # Si Df < h, la zapata sobresale, manejamos visualización
+    
+    # Zapata (Gris oscuro)
+    zapata_rect = patches.Rectangle((center_x - B/2, z_top), B, h_zapata, 
+                                    facecolor='#5D6D7E', edgecolor='black', linewidth=1.5, label='Zapata')
+    ax.add_patch(zapata_rect)
+    
+    # Pedestal / Columna (simbólico)
+    col_w = 0.3
+    col_rect = patches.Rectangle((center_x - col_w/2, z_top - 1.0), col_w, 1.0, 
+                                 facecolor='#ABB2B9', edgecolor='black', linestyle='--')
+    ax.add_patch(col_rect)
+    
+    # Línea de cota Df
+    ax.annotate(f'Df = {Df}m', xy=(center_x + B/2, Df), xytext=(center_x + B/2 + 0.5, Df),
+                arrowprops=dict(facecolor='black', arrowstyle='->'))
+
+    # Configuración Ejes
+    ax.set_ylim(max_depth, -1) # Invertir eje Y para profundidad
+    ax.set_xlim(0, max_width)
+    ax.set_ylabel("Profundidad (m)")
+    ax.set_xlabel("Ancho (m)")
+    ax.set_title("Perfil Estratigráfico y Posición de Cimentación")
+    ax.grid(True, linestyle=':', alpha=0.5)
+    
+    return fig
 
 # ==============================================================================
 # 3. INTERFAZ PRINCIPAL
 # ==============================================================================
-def app_principal():
-    st.title("🏗️ ToolZapatas Pro")
-    st.markdown("**Diseño y Optimización de Cimentaciones Superficiales**")
 
-    tab1, tab2, tab3 = st.tabs([
-        "📝 1. Datos de Entrada", 
-        "🚀 2. Optimización Automática", 
-        "📐 3. Detalles y Planos"
-    ])
+def main():
+    st.title("🏗️ ToolZapatas v2.0: Diseño Geotécnico Detallado")
+    
+    # --- BARRA LATERAL: CARGAS Y GEOMETRÍA ---
+    with st.sidebar:
+        st.header("1. Datos de Carga y Geometría")
+        st.info("Defina las cargas de servicio y la geometría inicial.")
+        P_serv = st.number_input("Carga Axial P (Ton)", value=50.0)
+        B_input = st.number_input("Ancho B (m)", value=1.5, step=0.1)
+        L_input = st.number_input("Largo L (m)", value=1.5, step=0.1)
+        h_input = st.number_input("Espesor h (m)", value=0.4, step=0.05)
+        Df_input = st.number_input("Profundidad Desplante Df (m)", value=1.5, step=0.1)
+        FS_req = st.slider("FS Requerido", 2.0, 4.0, 3.0)
 
-    # --------------------------------------------------------------------------
-    # TAB 1: INPUTS
-    # --------------------------------------------------------------------------
-    with tab1:
-        c1, c2, c3 = st.columns(3)
-        
-        with c1:
-            st.subheader("Cargas (Servicio)")
-            P = st.number_input("Carga Axial P (Ton)", 1.0, 1000.0, 50.0)
-            Mx = st.number_input("Momento Mx (Ton-m)", 0.0, 100.0, 2.0)
-            My = st.number_input("Momento My (Ton-m)", 0.0, 100.0, 0.0)
-        
-        with c2:
-            st.subheader("Suelo (Geotecnia)")
-            phi = st.number_input("Fricción Phi (°)", 0.0, 45.0, 30.0)
-            c_soil = st.number_input("Cohesión C (Ton/m2)", 0.0, 50.0, 0.0)
-            gamma = st.number_input("Peso Esp. Gamma (Ton/m3)", 1.0, 2.5, 1.8)
-            Df = st.number_input("Profundidad Df (m)", 0.5, 5.0, 1.5)
-            FS_req = st.slider("FS Requerido", 1.5, 4.0, 3.0)
+    # --- TABS ---
+    tab_suelo, tab_calc, tab_opt = st.tabs(["🌍 Estratigrafía", "📐 Cálculos y Resultados", "🚀 Optimización"])
 
-        with c3:
-            st.subheader("Materiales")
-            fc = st.selectbox("Concreto f'c (MPa)", [21, 28, 35, 42], index=1)
-            fy = st.number_input("Acero fy (MPa)", 240, 500, 420)
+    # ----------------------------------------------------------------------
+    # TAB 1: ESTRATIGRAFÍA (NUEVO)
+    # ----------------------------------------------------------------------
+    with tab_suelo:
+        col_s1, col_s2 = st.columns([1, 1])
         
-        # Guardar en sesión
-        st.session_state['params_input'] = ZapataInput(P, Mx, My, phi, c_soil, gamma, Df, fc, fy, FS_req)
+        with col_s1:
+            st.subheader("Definición de Capas de Suelo")
+            st.markdown("Edite la tabla para agregar estratos. **El orden es de arriba hacia abajo.**")
+            
+            # DataFrame Inicial
+            data_inicial = [
+                {"Tipo": "Relleno", "Espesor (m)": 1.0, "Gamma (Ton/m3)": 1.6, "Cohesion (Ton/m2)": 0.0, "Phi (°)": 28.0},
+                {"Tipo": "Arcilla", "Espesor (m)": 3.0, "Gamma (Ton/m3)": 1.8, "Cohesion (Ton/m2)": 5.0, "Phi (°)": 15.0},
+                {"Tipo": "Arena", "Espesor (m)": 5.0, "Gamma (Ton/m3)": 1.9, "Cohesion (Ton/m2)": 0.0, "Phi (°)": 32.0},
+            ]
+            
+            df_estratos = st.data_editor(
+                data_inicial,
+                column_config={
+                    "Tipo": st.column_config.SelectboxColumn(options=["Relleno", "Arcilla", "Arena", "Grava", "Roca"]),
+                    "Phi (°)": st.column_config.NumberColumn(min_value=0, max_value=45),
+                    "Cohesion (Ton/m2)": st.column_config.NumberColumn(min_value=0.0)
+                },
+                num_rows="dynamic",
+                use_container_width=True
+            )
+            
+            # Convertir a DataFrame de Pandas seguro
+            df_soil = pd.DataFrame(df_estratos)
         
-        # Cálculo Rápido de Capacidad
-        q_est = calc_capacidad_portante(1.5, 1.5, Df, phi, c_soil, gamma)
-        st.info(f"💡 Capacidad de carga estimada para una zapata de 1.5x1.5m: **{q_est:.2f} Ton/m²**")
+        with col_s2:
+            st.subheader("Perfil Gráfico")
+            if not df_soil.empty:
+                fig_soil = plot_perfil_estratigrafico(df_soil, Df_input, B_input, L_input, h_input)
+                st.pyplot(fig_soil)
+            else:
+                st.warning("Ingrese al menos un estrato.")
 
-    # --------------------------------------------------------------------------
-    # TAB 2: OPTIMIZACIÓN
-    # --------------------------------------------------------------------------
-    with tab2:
-        st.subheader("🤖 Motor de Optimización")
-        st.write("El algoritmo buscará la zapata de menor costo que cumpla con Geotecnia (FS) y Estructura (ACI 318).")
+    # ----------------------------------------------------------------------
+    # TAB 2: CÁLCULOS (MOTOR TRANSPARENTE)
+    # ----------------------------------------------------------------------
+    with tab_calc:
+        st.subheader("Memoria de Cálculo Geotécnico")
         
-        col_o1, col_o2 = st.columns([1, 3])
-        with col_o1:
-            if st.button("EJECUTAR DISEÑO", type="primary"):
-                inp = st.session_state['params_input']
-                resultados = []
-                
-                # Barrido de dimensiones (Brute Force Inteligente)
-                prog_bar = st.progress(0)
-                B_range = np.arange(0.8, 3.5, 0.1) # De 0.8m a 3.5m
-                L_factor = [1.0, 1.2, 1.5] # Cuadrada o Rectangular
-                H_range = np.arange(0.3, 0.8, 0.05) # Espesores
-                
-                total_iter = len(B_range)*len(L_factor)*len(H_range)
-                curr = 0
-                
-                for B in B_range:
-                    for lf in L_factor:
-                        L = B * lf
-                        for h in H_range:
-                            curr += 1
-                            if curr % 50 == 0: prog_bar.progress(curr/total_iter)
-                            
-                            res = verificar_zapata(B, L, h, inp)
-                            if res["Valido"]:
-                                res_clean = {
-                                    "B (m)": round(B, 2), "L (m)": round(L, 2), "h (m)": round(h, 2),
-                                    "FS Geo": round(res["FS_geo"], 2),
-                                    "Volumen": round(res["Volumen"], 2),
-                                    "Costo_Idx": round(res["Costo_Idx"], 1),
-                                    "As (cm2)": round(res["As_req_cm2"], 2),
-                                    "Rat_Punz": round(res["Ratio_Punz"], 2)
-                                }
-                                resultados.append(res_clean)
-                
-                prog_bar.empty()
-                
-                if resultados:
-                    df_res = pd.DataFrame(resultados).sort_values("Costo_Idx")
-                    best = df_res.iloc[0]
-                    st.session_state['opt_zapata'] = best.to_dict()
-                    st.success("✅ Diseño Óptimo Encontrado")
-                    
-                    # Métricas Top
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Dimensiones", f"{best['B (m)']} x {best['L (m)']} m")
-                    m2.metric("Espesor (h)", f"{best['h (m)']} m")
-                    m3.metric("Concreto", f"{best['Volumen']} m³")
-                    m4.metric("Acero Req", f"{best['As (cm2)']} cm²")
-                    
-                    st.dataframe(df_res.head(5), use_container_width=True)
-                else:
-                    st.error("No se encontró solución. Aumente el rango de búsqueda o mejore el suelo.")
-
-    # --------------------------------------------------------------------------
-    # TAB 3: DETALLES
-    # --------------------------------------------------------------------------
-    with tab3:
-        opt = st.session_state.get('opt_zapata')
-        if not opt:
-            st.warning("⚠️ Ejecute la optimización primero.")
+        if df_soil.empty:
+            st.error("Por favor defina la estratigrafía primero.")
         else:
-            B, L, h = opt["B (m)"], opt["L (m)"], opt["h (m)"]
-            inp = st.session_state['params_input']
+            # 1. Obtener suelo en la punta
+            suelo_punta = obtener_suelo_en_punta(df_soil, Df_input)
             
-            st.subheader(f"Análisis Detallado: Zapata {B}x{L}x{h}m")
-            
-            # Recalcular datos precisos para plot
-            res_det = verificar_zapata(B, L, h, inp)
-            
-            col_d1, col_d2 = st.columns([1, 1])
-            
-            with col_d1:
-                st.markdown("#### 📊 Distribución de Presiones")
-                # Gráfico de Planta con mapa de calor de presiones
-                fig, ax = plt.subplots(figsize=(5, 5))
-                
-                # Zapata
-                rect = patches.Rectangle((-B/2, -L/2), B, L, linewidth=2, edgecolor='black', facecolor='none')
-                ax.add_patch(rect)
-                
-                # Columna (Asumida 0.3x0.3)
-                col_rect = patches.Rectangle((-0.15, -0.15), 0.3, 0.3, color='gray')
-                ax.add_patch(col_rect)
-                
-                # Excentricidad
-                ex = inp.My / (inp.P + B*L*h*2.4)
-                ey = inp.Mx / (inp.P + B*L*h*2.4)
-                ax.plot(ex, ey, 'rx', markersize=10, markeredgewidth=2, label='Centro Presión')
-                
-                # Núcleo Central (Rombo B/6, L/6)
-                nucleus = patches.Polygon([(-B/6, 0), (0, L/6), (B/6, 0), (0, -L/6)], 
-                                          closed=True, fill=True, color='green', alpha=0.1, label='Núcleo Central')
-                ax.add_patch(nucleus)
-                
-                ax.set_xlim(-B/2 - 0.5, B/2 + 0.5)
-                ax.set_ylim(-L/2 - 0.5, L/2 + 0.5)
-                ax.set_xlabel("B (m)")
-                ax.set_ylabel("L (m)")
-                ax.legend(loc='upper right')
-                ax.grid(True, ls=':')
-                ax.set_title(f"Excentricidad e=({ex:.2f}, {ey:.2f})")
-                
-                st.pyplot(fig)
+            # Mostrar propiedades detectadas
+            st.markdown(f"""
+            **Suelo detectado en la cota de cimentación ($D_f = {Df_input}$ m):**
+            * Tipo: `{suelo_punta['Tipo']}`
+            * Cohesión ($c$): {suelo_punta['Cohesion (Ton/m2)']} Ton/m²
+            * Fricción ($\phi$): {suelo_punta['Phi (°)']}°
+            * Peso Unitario ($\gamma$): {suelo_punta['Gamma (Ton/m3)']} Ton/m³
+            """)
+            st.divider()
 
-            with col_d2:
-                st.markdown("#### ✅ Verificaciones ACI 318")
-                
-                checks = [
-                    {"Check": "Capacidad Portante", "Valor": f"{res_det['q_max']:.1f} vs {res_det['q_ult']:.1f} Ton/m2", "Status": "OK" if res_det['FS_geo']>=inp.FS_geo_req else "FALLA"},
-                    {"Check": "Punzonamiento", "Valor": f"Ratio {res_det['Ratio_Punz']:.2f}", "Status": "OK" if res_det['Ratio_Punz']<1.0 else "FALLA"},
-                    {"Check": "Cortante (1-via)", "Valor": f"Ratio {res_det['Ratio_Cort']:.2f}", "Status": "OK" if res_det['Ratio_Cort']<1.0 else "FALLA"},
-                ]
-                st.table(pd.DataFrame(checks))
-                
-                st.info(f"**Acero Refuerzo (Ambas direcciones):** Usar {opt['As (cm2)']} cm². \n\n"
-                        f"Sug: {int(np.ceil(opt['As (cm2)']/1.29))} varillas #4 (1/2\")")
+            # 2. Ejecutar Cálculo Meyerhof
+            res = calcular_meyerhof(
+                B_input, L_input, Df_input, 
+                suelo_punta['Gamma (Ton/m3)'], 
+                suelo_punta['Cohesion (Ton/m2)'], 
+                suelo_punta['Phi (°)'], 
+                P_serv
+            )
+            
+            q_ult = res['q_ult']
+            q_adm = q_ult / FS_req
+            area = B_input * L_input
+            peso_propio = area * h_input * 2.4 # Concreto
+            q_act = (P_serv + peso_propio) / area
+            FS_calc = q_ult / q_act if q_act > 0 else 999
 
-            # Botón PDF simple
-            if st.button("Descargar Memoria de Cálculo"):
-                buffer = BytesIO()
-                p = canvas.Canvas(buffer, pagesize=letter)
-                p.drawString(50, 750, "TOOLZAPATAS PRO - REPORTE DE CALCULO")
-                p.drawString(50, 720, f"Dimensiones: {B} x {L} x {h} m")
-                p.drawString(50, 700, f"Carga Axial: {inp.P} Ton")
-                p.drawString(50, 680, f"Esfuerzo Max Suelo: {res_det['q_max']:.2f} Ton/m2")
-                p.drawString(50, 660, f"Capacidad Ultima: {res_det['q_ult']:.2f} Ton/m2")
-                p.drawString(50, 640, f"Factor de Seguridad: {res_det['FS_geo']:.2f}")
-                p.drawString(50, 600, "Cumple normativa ACI 318 y NSR-10")
-                p.save()
-                st.download_button("📥 Bajar PDF", buffer, "Memoria_Zapata.pdf", "application/pdf")
+            # 3. Mostrar Ecuaciones
+            st.markdown("### 1. Ecuación General de Capacidad de Carga (Meyerhof)")
+            st.latex(r"q_{ult} = c N_c s_c d_c + q N_q s_q d_q + 0.5 \gamma B N_\gamma s_\gamma d_\gamma")
+            
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**Factores de Capacidad (N)**")
+                st.latex(f"N_c = {res['Nc']:.2f}")
+                st.latex(f"N_q = {res['Nq']:.2f}")
+                st.latex(f"N_\gamma = {res['Ny']:.2f}")
+            with c2:
+                st.markdown("**Factores de Forma (s)**")
+                st.latex(f"s_c = {res['sc']:.2f}")
+                st.latex(f"s_q = {res['sq']:.2f}")
+                st.latex(f"s_\gamma = {res['sy']:.2f}")
+            with c3:
+                st.markdown("**Factores de Profundidad (d)**")
+                st.latex(f"d_c = {res['dc']:.2f}")
+                st.latex(f"d_q = {res['dq']:.2f}")
+                st.latex(f"d_\gamma = {res['dy']:.2f}")
 
-# ==============================================================================
-# RUN
-# ==============================================================================
+            st.markdown("### 2. Contribución por Término (Ton/m²)")
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Cohesión", f"{res['term_c']:.2f}")
+            t2.metric("Sobrecarga (q)", f"{res['term_q']:.2f}")
+            t3.metric("Fricción/Peso", f"{res['term_y']:.2f}")
+            
+            st.divider()
+            
+            # 4. Resultados Finales
+            st.markdown("### 3. Verificación Final")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Q Última", f"{q_ult:.2f} Ton/m²")
+            k2.metric("Q Admisible", f"{q_adm:.2f} Ton/m²")
+            k3.metric("Q Actuante", f"{q_act:.2f} Ton/m²", delta_color="inverse", delta=f"P.Propio: {peso_propio:.1f}T")
+            
+            estado = "✅ CUMPLE" if FS_calc >= FS_req else "❌ FALLA"
+            k4.metric("Factor Seguridad", f"{FS_calc:.2f}", delta=estado)
+            
+            if FS_calc < FS_req:
+                st.error(f"La zapata falla por capacidad portante. Aumente B, L o Df. (FS Actual: {FS_calc:.2f} < {FS_req})")
+            else:
+                st.success("Diseño Geotécnico Satisfactorio.")
+
+    # ----------------------------------------------------------------------
+    # TAB 3: OPTIMIZACIÓN SIMPLE
+    # ----------------------------------------------------------------------
+    with tab_opt:
+        st.subheader("Buscador de Dimensiones Óptimas")
+        if st.button("Buscar B óptimo para la carga actual"):
+            if df_soil.empty:
+                st.error("Defina estratigrafía primero.")
+            else:
+                suelo_opt = obtener_suelo_en_punta(df_soil, Df_input)
+                
+                found = False
+                # Iterar B desde 0.5 hasta 5.0m
+                for b_try in np.arange(0.5, 5.0, 0.1):
+                    # Asumimos zapata cuadrada para optimización rápida
+                    res_opt = calcular_meyerhof(
+                        b_try, b_try, Df_input,
+                        suelo_opt['Gamma (Ton/m3)'], suelo_opt['Cohesion (Ton/m2)'], suelo_opt['Phi (°)'], P_serv
+                    )
+                    
+                    q_u = res_opt['q_ult']
+                    area_opt = b_try**2
+                    q_act_opt = (P_serv + (area_opt*h_input*2.4)) / area_opt
+                    fs_opt = q_u / q_act_opt
+                    
+                    if fs_opt >= FS_req:
+                        st.success(f"✅ Dimensión Óptima Encontrada: B = L = {b_try:.2f} m")
+                        st.write(f"FS Resultante: {fs_opt:.2f}")
+                        found = True
+                        break
+                
+                if not found:
+                    st.error("No se encontró solución razonable (B < 5m). Revise suelo o cargas.")
+
 if __name__ == "__main__":
-    app_principal()
+    main()
