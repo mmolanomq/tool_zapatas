@@ -8,7 +8,7 @@ import matplotlib.patches as patches
 # ==============================================================================
 # 0. CONFIGURACIÓN Y ESTILOS
 # ==============================================================================
-st.set_page_config(page_title="ToolZapatas v3.1 Stable", layout="wide", page_icon="🏗️")
+st.set_page_config(page_title="ToolZapatas v3.2 Safe", layout="wide", page_icon="🏗️")
 
 st.markdown("""
 <style>
@@ -27,7 +27,6 @@ if 'proyecto' not in st.session_state:
         "cargas": {"P": 50.0},
         "geometria": {"B": 1.5, "L": 1.5, "Df": 1.5, "h": 0.4},
         "suelo": pd.DataFrame(),
-        "resultados_geo": {}
     }
 
 # ==============================================================================
@@ -45,7 +44,6 @@ def dibujar_mecanismo_meyerhof():
     ax.add_patch(rect)
     ax.text(0, 0.25, "Zapata", ha='center', color='white', weight='bold')
 
-    # Zonas de Falla
     # Zona I: Activa
     ax.add_patch(patches.Polygon([(-B/2, 0), (B/2, 0), (0, -1.5)], closed=True, facecolor='#d7bde2', alpha=0.6, label='Zona I: Activa'))
     # Zona II: Radial (Simplificada)
@@ -76,7 +74,9 @@ def calc_asentamiento_elastico(d_sigma, B, Es_ton_m2, nu):
 def calc_consolidacion(H, e0, Cc, sigma_0, delta_sigma):
     """Terzaghi unidimensional."""
     if Cc <= 0 or H <= 0 or sigma_0 <= 0: return 0.0
-    return (Cc * H / (1 + e0)) * np.log10((sigma_0 + delta_sigma) / sigma_0)
+    val = (sigma_0 + delta_sigma) / sigma_0
+    if val <= 0: return 0.0
+    return (Cc * H / (1 + e0)) * np.log10(val)
 
 # ==============================================================================
 # 3. MÓDULOS DE INTERFAZ
@@ -86,7 +86,8 @@ def modulo_sidebar():
     """Configuración Global"""
     st.sidebar.header("🎛️ Parámetros Globales")
     
-    # CORRECCIÓN IMPORTANTE: Usamos 'proj' en lugar de sobrescribir 'st'
+    # IMPORTANTE: Usamos 'proj' para referenciar el estado. 
+    # NO uses 'st = ...' porque rompería la librería streamlit.
     proj = st.session_state['proyecto']
     
     proj['cargas']['P'] = st.sidebar.number_input("Carga Axial P (Ton)", 1.0, 5000.0, 50.0)
@@ -100,7 +101,7 @@ def modulo_sidebar():
 def modulo_estratigrafia():
     """Tabla de Suelos"""
     st.subheader("1. Caracterización del Subsuelo")
-    st.info("Define las capas de arriba hacia abajo. Para cálculo de asentamientos, rellena Es, Cc y e0.")
+    st.info("Define las capas de arriba hacia abajo.")
 
     if st.session_state['proyecto']['suelo'].empty:
         # Datos iniciales de ejemplo
@@ -121,11 +122,14 @@ def modulo_estratigrafia():
         z = 0
         fig, ax = plt.subplots(figsize=(8, 1.5))
         for i, r in df_edit.iterrows():
-            ax.barh(0, r['Esp (m)'], left=z, height=0.5, align='center', edgecolor='black', alpha=0.5)
-            ax.text(z + r['Esp (m)']/2, 0, r['Tipo'], ha='center', va='center', fontsize=8)
-            z += r['Esp (m)']
-        ax.set_xlim(0, z); ax.set_yticks([]); ax.set_xlabel("Profundidad Acumulada (m)")
-        ax.invert_xaxis() # Para verlo vertical mentalmente o dejarlo horizontal
+            try:
+                esp = float(r['Esp (m)'])
+                ax.barh(0, esp, left=z, height=0.5, align='center', edgecolor='black', alpha=0.5)
+                ax.text(z + esp/2, 0, str(r['Tipo']), ha='center', va='center', fontsize=8)
+                z += esp
+            except: pass
+        ax.set_xlim(0, z if z>0 else 1); ax.set_yticks([]); ax.set_xlabel("Profundidad Acumulada (m)")
+        ax.invert_xaxis()
         st.pyplot(fig)
 
 def modulo_capacidad():
@@ -145,23 +149,27 @@ def modulo_capacidad():
     suelo_punta = df.iloc[-1]
     q_sobrecarga = 0 # gamma * Df
     
-    # Cálculo preciso de q (sobrecarga) acumulando gammas
-    for _, r in df.iterrows():
-        dz = r['Esp (m)']
-        z_top = z_acum
-        z_bot = z_acum + dz
-        
-        if Df >= z_bot:
-            q_sobrecarga += r['Gamma (T/m3)'] * dz
-        elif z_top <= Df < z_bot:
-            q_sobrecarga += r['Gamma (T/m3)'] * (Df - z_top)
-            suelo_punta = r
-            break
-        z_acum += dz
+    try:
+        # Cálculo preciso de q (sobrecarga) acumulando gammas
+        for _, r in df.iterrows():
+            dz = float(r['Esp (m)'])
+            z_top = z_acum
+            z_bot = z_acum + dz
+            
+            if Df >= z_bot:
+                q_sobrecarga += float(r['Gamma (T/m3)']) * dz
+            elif z_top <= Df < z_bot:
+                q_sobrecarga += float(r['Gamma (T/m3)']) * (Df - z_top)
+                suelo_punta = r
+                break
+            z_acum += dz
+    except Exception as e:
+        st.error(f"Error leyendo datos numéricos del suelo: {e}")
+        return
 
-    phi = suelo_punta['phi']
-    c = suelo_punta['c']
-    gamma_punta = suelo_punta['Gamma (T/m3)']
+    phi = float(suelo_punta['phi'])
+    c = float(suelo_punta['c'])
+    gamma_punta = float(suelo_punta['Gamma (T/m3)'])
 
     # Factores Meyerhof
     rad = np.radians(phi)
@@ -222,62 +230,73 @@ def modulo_asentamientos():
     total_Sc = 0
     tabla_res = []
 
-    # Calcular Presión efectiva inicial acumulada (sigma_v0)
-    # Necesitamos saber el esfuerzo efectivo en el punto medio de cada estrato bajo la zapata
-    
     for _, r in df.iterrows():
-        z_abs_bot = z_abs_top + r['Esp (m)']
+        # --- BLINDAJE DE VARIABLES ---
+        # Inicializamos a cero ANTES de cualquier cálculo para evitar UnboundLocalError
+        Se = 0.0
+        Sc = 0.0
+        # -----------------------------
         
-        # Analizamos si el estrato está debajo de la zapata (al menos parcialmente)
-        if z_abs_bot > Df:
-            # Definir tramo efectivo del estrato bajo la zapata
-            z_start = max(z_abs_top, Df)
-            z_end = z_abs_bot
-            H_eff = z_end - z_start
+        try:
+            esp = float(r['Esp (m)'])
+            z_abs_bot = z_abs_top + esp
             
-            # Punto medio de este sub-estrato (desde la superficie)
-            z_mid_abs = z_start + H_eff/2
-            
-            # Distancia desde la base de la zapata hasta el punto medio (para Boussinesq)
-            z_local = z_mid_abs - Df
-            
-            # 1. Delta Sigma (Incremento por carga)
-            d_sigma = calc_incremento_esfuerzo(P, B, L, z_local)
-            
-            # 2. Sigma Inicial (Geostático)
-            # Aproximación: Peso de todo el suelo encima de z_mid_abs
-            # Re-iteramos para calcular peso acumulado hasta z_mid_abs
-            sigma_0 = 0
-            z_temp = 0
-            for _, r_inner in df.iterrows():
-                if z_temp + r_inner['Esp (m)'] < z_mid_abs:
-                    sigma_0 += r_inner['Esp (m)'] * r_inner['Gamma (T/m3)']
-                    z_temp += r_inner['Esp (m)']
-                else:
-                    # Estamos en el estrato final, sumamos el pedazo restante
-                    remaining = z_mid_abs - z_temp
-                    sigma_0 += remaining * r_inner['Gamma (T/m3)']
-                    break
-            
-            # 3. Asentamientos
-            Se = calc_asentamiento_elastico(d_sigma, B, r['Es (T/m2)'], r['nu'])
-            Sc = 0
-            if r['Cc'] > 0: # Si es compresible
-                Sc = calc_consolidacion(H_eff, r['e0'], r['Cc'], sigma_0, d_sigma)
+            # Analizamos si el estrato está debajo de la zapata (al menos parcialmente)
+            if z_abs_bot > Df:
+                # Definir tramo efectivo del estrato bajo la zapata
+                z_start = max(z_abs_top, Df)
+                z_end = z_abs_bot
+                H_eff = z_end - z_start
+                
+                if H_eff > 0:
+                    # Punto medio de este sub-estrato (desde la superficie)
+                    z_mid_abs = z_start + H_eff/2
+                    # Distancia desde la base de la zapata hasta el punto medio
+                    z_local = z_mid_abs - Df
+                    
+                    # 1. Delta Sigma
+                    d_sigma = calc_incremento_esfuerzo(P, B, L, z_local)
+                    
+                    # 2. Sigma Inicial (Geostático)
+                    sigma_0 = 0
+                    z_temp = 0
+                    for _, r_inner in df.iterrows():
+                        esp_inner = float(r_inner['Esp (m)'])
+                        gam_inner = float(r_inner['Gamma (T/m3)'])
+                        if z_temp + esp_inner < z_mid_abs:
+                            sigma_0 += esp_inner * gam_inner
+                            z_temp += esp_inner
+                        else:
+                            remaining = z_mid_abs - z_temp
+                            sigma_0 += remaining * gam_inner
+                            break
+                    
+                    # 3. Asentamientos
+                    Es = float(r['Es (T/m2)'])
+                    nu = float(r['nu'])
+                    Se = calc_asentamiento_elastico(d_sigma, B, Es, nu)
+                    
+                    Cc = float(r['Cc'])
+                    if Cc > 0:
+                        e0 = float(r['e0'])
+                        Sc = calc_consolidacion(H_eff, e0, Cc, sigma_0, d_sigma)
 
-            total_Se += Se
-            total_Sc += Sc
+                    total_Se += Se
+                    total_Sc += Sc
+                    
+                    tabla_res.append({
+                        "Estrato": r['Tipo'],
+                        "H efec (m)": round(H_eff, 2),
+                        "σ'0 (T/m2)": round(sigma_0, 2),
+                        "Δσ (T/m2)": round(d_sigma, 2),
+                        "S. Elástico (cm)": round(Se*100, 2),
+                        "S. Consol (cm)": round(Sc*100, 2)
+                    })
             
-            tabla_res.append({
-                "Estrato": r['Tipo'],
-                "H efec (m)": round(H_eff, 2),
-                "σ'0 (T/m2)": round(sigma_0, 2),
-                "Δσ (T/m2)": round(d_sigma, 2),
-                "S. Elástico (cm)": round(Se*100, 2),
-                "S. Consol (cm)": round(Sc*100, 2)
-            })
+            z_abs_top = z_abs_bot
             
-        z_abs_top = z_abs_bot
+        except Exception as e:
+            st.warning(f"Error calculando estrato {r.get('Tipo', '?')}: {e}")
 
     st.table(pd.DataFrame(tabla_res))
     
@@ -290,7 +309,7 @@ def modulo_asentamientos():
 # 4. RUN
 # ==============================================================================
 def main():
-    st.title("🏗️ ToolZapatas v3.1 Modular")
+    st.title("🏗️ ToolZapatas v3.2 Modular")
     modulo_sidebar()
     
     tabs = st.tabs(["🌍 1. Estratigrafía", "⚙️ 2. Capacidad Portante", "📉 3. Asentamientos"])
